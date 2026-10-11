@@ -45,9 +45,22 @@ type (
 		endpoint string
 		mbps     float64
 	}
+	mtuMsg struct {
+		endpoint string
+		ok       bool
+		dcns     uint8
+		seen     bool
+	}
 	barEndMsg struct{ label, summary string }
 	doneMsg   struct{}
 )
+
+func (m mtuMsg) str() string {
+	if !m.seen {
+		return "-"
+	}
+	return mtuVerdict(m.ok, m.dcns)
+}
 
 type emitter func(tea.Msg)
 
@@ -92,6 +105,8 @@ func plainEmit(msg tea.Msg) {
 		}
 	case speedMsg:
 		fmt.Fprintf(plainOut, "  %-22s %s\n", m.endpoint, speedStr(m.mbps))
+	case mtuMsg:
+		fmt.Fprintf(plainOut, "  %-22s %s\n", m.endpoint, m.str())
 	case barEndMsg:
 		fmt.Fprintf(plainOut, "%s: %s\n", m.label, m.summary)
 	}
@@ -140,6 +155,7 @@ type scanModel struct {
 	feed   []foundMsg
 	nodes  []nodeStat
 	speeds []speedMsg
+	mtus   []mtuMsg
 
 	feedFull  bool
 	nodesAll  bool
@@ -221,6 +237,15 @@ func (m scanModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.speeds = insertSorted(m.speeds, msg, func(a, b speedMsg) bool { return a.mbps > b.mbps })
 		return m, nil
 
+	case mtuMsg:
+		m.mtus = insertSorted(m.mtus, msg, func(a, b mtuMsg) bool {
+			if a.ok != b.ok {
+				return a.ok
+			}
+			return a.endpoint < b.endpoint
+		})
+		return m, nil
+
 	case barEndMsg:
 		m.label, m.total, m.done = "", 0, 0
 		m.lines = append(m.lines, m.st.ok.Render(glyphOK+" ")+m.st.title.Render(msg.label)+": "+msg.summary+took(m.barAt))
@@ -230,7 +255,7 @@ func (m scanModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case doneMsg:
 		m.finished = true
 		if m.dropLists {
-			m.feed, m.speeds, m.nodes = nil, nil, nil
+			m.feed, m.speeds, m.mtus, m.nodes = nil, nil, nil, nil
 		}
 		return m, tea.Quit
 
@@ -355,6 +380,9 @@ func (m scanModel) View() string {
 	if len(m.speeds) > 0 {
 		b.WriteString("\n" + m.renderSpeeds(rows))
 	}
+	if len(m.mtus) > 0 {
+		b.WriteString("\n" + m.renderMTU(rows))
+	}
 	if !m.finished {
 		b.WriteString("\n" + st.dim.Render(m.hint()) + "\n")
 	}
@@ -434,6 +462,22 @@ func (m scanModel) renderSpeeds(limit int) string {
 			style = st.warn
 		}
 		b.WriteString(st.title.Render(pad(r.endpoint, 22)) + " " + style.Render(speedStr(r.mbps)) + "\n")
+	}
+	writeFeedRest(&b, st, extra)
+	return b.String()
+}
+
+func (m scanModel) renderMTU(limit int) string {
+	st := m.st
+	rows, extra := capped(m.mtus, limit)
+	var b strings.Builder
+	b.WriteString(st.dim.Render(pad("ENDPOINT", 22)+" MTU") + "\n")
+	for _, r := range rows {
+		style := st.accent
+		if !r.ok {
+			style = st.warn
+		}
+		b.WriteString(st.title.Render(pad(r.endpoint, 22)) + " " + style.Render(r.str()) + "\n")
 	}
 	writeFeedRest(&b, st, extra)
 	return b.String()

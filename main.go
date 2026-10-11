@@ -196,6 +196,16 @@ func runScanCmd(ctx context.Context, opts options) error {
 		})
 	}
 
+	// The MTU phase runs on the same picks the speedtest would take, for the
+	// same reason: per-endpoint detail is only worth its cost where the tables
+	// point. showsSpeed doubles as the gate - it is true exactly when phased
+	// results have somewhere to be shown.
+	if opts.tg && showsSpeed(opts) {
+		runWithUI(opts, cancel, false, "", "q to skip the rest", func(emit emitter) {
+			measureMTU(ctx, ph, time.Duration(opts.timeoutSec)*time.Second, emit)
+		})
+	}
+
 	// Held rather than returned: the scan itself succeeded, so the report file is
 	// still written and only the exit status carries the failure.
 	var outErr error
@@ -292,6 +302,74 @@ func fastestNote(speeds map[string]float64) string {
 		return "nothing measured"
 	}
 	return fmt.Sprintf("fastest %s at %s", speedStr(best), endpoint)
+}
+
+// endpointMTU re-handshakes the picked endpoint and runs one padded req_pq
+// per DC through it. The bool tells measured apart from never-dialled: a
+// tunnel that died between phases is not an MTU verdict.
+func endpointMTU(ctx context.Context, tn tunnel, endpoint string, timeout time.Duration) (uint8, bool) {
+	for attempt := 0; attempt < max(tn.attempts(), 1); attempt++ {
+		if ctx.Err() != nil {
+			break
+		}
+		if !tn.handshake(ctx, endpoint, timeout) {
+			continue
+		}
+		return tn.stack().telegramMTURTT(ctx, timeout), true
+	}
+	return 0, false
+}
+
+func measureMTU(ctx context.Context, ph phaseResult, timeout time.Duration, emit emitter) {
+	picks := speedTargets(ph.results)
+	const label = "MTU phase: one padded probe per DC on picked endpoints"
+	emit(barBeginMsg{label: label, total: len(picks)})
+
+	tn, err := newTunnel(ph.run)
+	if err != nil {
+		emit(stepMsg{fail: true, summary: fmt.Sprintf("MTU phase failed: %v", err)})
+		return
+	}
+	defer closeAfterDrain(tn)
+
+	mtus := make(map[string]uint8, len(picks))
+	seen := make(map[string]bool, len(picks))
+	for _, p := range picks {
+		if ctx.Err() != nil {
+			break
+		}
+		mask, ok := endpointMTU(ctx, tn, p.endpoint, timeout)
+		seen[p.endpoint] = ok
+		if ok {
+			mtus[p.endpoint] = mask
+		}
+		emit(mtuMsg{endpoint: p.endpoint, ok: ok && mask == allDCs, dcns: mask, seen: ok})
+		emit(probedMsg{})
+	}
+	for i, r := range ph.results {
+		if ok := seen[r.endpoint]; ok {
+			ph.results[i].mtuDCs, ph.results[i].mtuOK, ph.results[i].mtuSeen = mtus[r.endpoint], mtus[r.endpoint] == allDCs, true
+		}
+	}
+
+	emit(barEndMsg{label: label, summary: mtuNote(mtus, seen)})
+	emit(doneMsg{})
+}
+
+func mtuNote(mtus map[string]uint8, seen map[string]bool) string {
+	if len(seen) == 0 {
+		return "nothing measured"
+	}
+	reached := 0
+	for ep := range seen {
+		if mtus[ep] == allDCs {
+			reached++
+		}
+	}
+	if reached == 0 {
+		return "no pick passed 1200B"
+	}
+	return fmt.Sprintf("%d/%d picks pass 1200B to all 5 DCs", reached, len(seen))
 }
 
 func closeAfterDrain(tn tunnel) {
@@ -429,7 +507,7 @@ func bestOverall(ph phaseResult) (endpointResult, bool) {
 	var best endpointResult
 	found := false
 	for _, r := range workingSorted(ph.results) {
-		if !found || lessByLossRTT(r, best) {
+		if !found || lessMTU(r, best) || (!lessMTU(best, r) && lessByLossRTT(r, best)) {
 			best, found = r, true
 		}
 	}

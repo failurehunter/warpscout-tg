@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"io"
+	"math/bits"
 	"net/netip"
 	"os"
 	"sort"
@@ -59,6 +60,9 @@ type endpointResult struct {
 	tgDCs    uint8         // mask of telegramDCs that answered through the tunnel
 	tgOK     bool          // every Telegram DC answered (tgDCs == allDCs)
 	tgSeen   bool          // -tg ran here, which tells "blocked" apart from "not checked"
+	mtuDCs   uint8         // DC mask of padded answers, valid only when mtuSeen
+	mtuOK    bool          // every DC answered padded (mtuDCs == allDCs)
+	mtuSeen  bool          // the MTU phase ran here, telling "blocked" apart from "not checked"
 	measured bool          // tunPing/loss were sampled (-tun-ping)
 	ok       bool
 	durable  bool
@@ -169,6 +173,58 @@ func tgHeaders(show bool) []string {
 		return nil
 	}
 	return []string{"TG"}
+}
+
+// mtuVerdict is the whole MTU answer in one word: whether full-size segments
+// flow. The column carries no latency — TG already times the path, and a slow
+// padded answer is still a pass.
+func mtuVerdict(ok bool, dcns uint8) string {
+	if ok {
+		return "ok"
+	}
+	if dcns == 0 {
+		return "blocked"
+	}
+	return fmt.Sprintf("%d/5", bits.OnesCount8(dcns))
+}
+
+func mtuStr(r endpointResult) string {
+	if !r.mtuSeen {
+		return "-"
+	}
+	return mtuVerdict(r.mtuOK, r.mtuDCs)
+}
+
+func mtuField(s string, show bool) string {
+	if !show {
+		return ""
+	}
+	return fmt.Sprintf("%-9s ", s)
+}
+
+func mtuCells(r endpointResult, show bool) []string {
+	if !show {
+		return nil
+	}
+	return []string{mtuStr(r)}
+}
+
+func mtuHeaders(show bool) []string {
+	if !show {
+		return nil
+	}
+	return []string{"MTU"}
+}
+
+// Keyed off "was it checked" like anyTG: a phase where padded answers die
+// everywhere is exactly when the column has something to say.
+func anyMTU(results []endpointResult) bool {
+	for _, r := range results {
+		if r.mtuSeen {
+			return true
+		}
+	}
+	return false
 }
 
 // -tg outranks every latency metric, so both notes say so: otherwise a slower
@@ -364,6 +420,14 @@ func lessByLossRTT(a, b endpointResult) bool {
 	return a.endpoint < b.endpoint
 }
 
+// lessMTU ranks an MTU-ok endpoint above one that is not, mirroring the picks
+// table: -conf and -best take the table's top row, not the fastest TG alone.
+// Unmeasured ("-") sorts with failed — the mark tells them apart, the way
+// tgOK lumps blocked with unchecked.
+func lessMTU(a, b endpointResult) bool {
+	return a.mtuOK && !b.mtuOK
+}
+
 func lessLossDur(la float32, da time.Duration, lb float32, db time.Duration) bool {
 	if la != lb {
 		return la < lb
@@ -389,11 +453,11 @@ func bestByPing(picks []endpointResult) endpointResult {
 }
 
 const (
-	reportRowFmt   = "%-22s %-13s %s%s%s%-10s %-6s %s\n"
-	nodePickRowFmt = "%-6s %-22s %-13s %s%s%s%-10s %s\n"
+	reportRowFmt   = "%-22s %-13s %s%s%s%s%-10s %-6s %s\n"
+	nodePickRowFmt = "%-6s %-22s %-13s %s%s%s%s%-10s %s\n"
 )
 
-func writeHeader(w io.Writer, working, probed int, ping, speed, tg bool) {
+func writeHeader(w io.Writer, working, probed int, ping, speed, tg, mtu bool) {
 	fmt.Fprintf(w, "# WARP endpoints: %d working / %d probed\n", working, probed)
 	fmt.Fprintf(w, "# %s\n", sortNote(ping, tg))
 	if outer != nil {
@@ -415,6 +479,9 @@ func writeHeader(w io.Writer, working, probed int, ping, speed, tg bool) {
 	if tg {
 		fmt.Fprintln(w, "# TG = MTProto round-trip to the slowest of the 5 Telegram DCs, dialled inside the tunnel; \"3/5\" = only some DCs answered, \"blocked\" = none did")
 	}
+	if mtu {
+		fmt.Fprintln(w, "# MTU = one 1200B padded req_pq per DC on picked endpoints (\"ok\" = all 5 answered); catches paths where small packets flow and full-size segments die")
+	}
 	fmt.Fprintln(w, "# SEEN AS = region external services see through the tunnel")
 	fmt.Fprintln(w, "# NODE / NODE LOCATION = Cloudflare WARP edge node the tunnel landed on, and where it sits")
 	fmt.Fprintln(w, "# One /24 pool can land on several different nodes - NODE is per endpoint, not per subnet")
@@ -425,7 +492,8 @@ func writeFullReport(w io.Writer, results []endpointResult, ping bool) {
 	torn := tornSorted(results)
 	speed := anySpeed(results)
 	tg := anyTG(results)
-	writeHeader(w, len(working), len(results), ping, speed, tg)
+	mtu := anyMTU(results)
+	writeHeader(w, len(working), len(results), ping, speed, tg, mtu)
 	if len(working) == 0 && len(torn) == 0 {
 		fmt.Fprintln(w, "\nNo working endpoints found.")
 		return
@@ -445,9 +513,10 @@ func writeFullReport(w io.Writer, results []endpointResult, ping bool) {
 }
 
 func writeRows(w io.Writer, results []endpointResult, ping, speed, tg bool) {
-	fmt.Fprintf(w, reportRowFmt, "ENDPOINT", "ENDPOINT PING", tunFields("TUN PING", "LOSS", ping), tgField("TG", tg), speedField("SPEED", speed), "SEEN AS", "NODE", "NODE LOCATION")
+	mtu := anyMTU(results)
+	fmt.Fprintf(w, reportRowFmt, "ENDPOINT", "ENDPOINT PING", tunFields("TUN PING", "LOSS", ping), tgField("TG", tg), mtuField("MTU", mtu), speedField("SPEED", speed), "SEEN AS", "NODE", "NODE LOCATION")
 	for _, r := range results {
-		fmt.Fprintf(w, reportRowFmt, r.endpoint, r.epPingStr(), tunFieldsOf(r, ping), tgField(tgStr(r), tg), speedField(speedStr(r.speed), speed), exitRegion(r.exit), exitColo(r.exit), exitColoLocation(r.exit))
+		fmt.Fprintf(w, reportRowFmt, r.endpoint, r.epPingStr(), tunFieldsOf(r, ping), tgField(tgStr(r), tg), mtuField(mtuStr(r), mtu), speedField(speedStr(r.speed), speed), exitRegion(r.exit), exitColo(r.exit), exitColoLocation(r.exit))
 	}
 }
 
@@ -485,6 +554,7 @@ func writeConsole(w io.Writer, ph phaseResult, r *lipgloss.Renderer, ping bool) 
 	fmt.Fprintf(w, "Working:   %s\n", st.ok.Render(strconv.Itoa(len(working)))+st.dim.Render(" / ")+strconv.Itoa(len(results))+" probed")
 	writeTornNote(w, st, len(torn))
 	writeTGNote(w, st, working)
+	writeMTUNote(w, st, working)
 	writePicksTable(w, st, working, torn, ping)
 }
 
@@ -508,6 +578,36 @@ func writeTGNote(w io.Writer, st conStyles, working []endpointResult) {
 	// accounts homed there cannot connect through any of these endpoints.
 	if missing != 0 {
 		fmt.Fprintf(w, "           %s\n", st.fail.Render(dcNames(missing)+" never answered from any endpoint"))
+	}
+}
+
+// writeMTUNote counts the picks the MTU phase actually measured: full-size
+// segments either flow to every DC or they do not, and a pick that never got
+// measured is not a pick that failed.
+func writeMTUNote(w io.Writer, st conStyles, working []endpointResult) {
+	var measured []endpointResult
+	for _, r := range working {
+		if r.mtuSeen {
+			measured = append(measured, r)
+		}
+	}
+	if len(measured) == 0 {
+		return
+	}
+	reached, missing := 0, allDCs
+	for _, r := range measured {
+		if r.mtuOK {
+			reached++
+		}
+		missing &^= r.mtuDCs
+	}
+	count := st.ok.Render(strconv.Itoa(reached))
+	if reached == 0 {
+		count = st.fail.Render("0")
+	}
+	fmt.Fprintf(w, "MTU:       %s\n", count+st.dim.Render(" / ")+strconv.Itoa(len(measured))+" picks pass 1200B to all 5 DCs")
+	if missing != 0 {
+		fmt.Fprintf(w, "           %s\n", st.fail.Render(dcNames(missing)+" never answered padded from any pick"))
 	}
 }
 
@@ -557,6 +657,7 @@ type pickRow struct {
 	cells   []string
 	status  int
 	tgOK    bool
+	mtuOK   bool
 	tg      time.Duration
 	loss    float32
 	latency time.Duration
@@ -588,8 +689,9 @@ func metricCols(first, n int) map[int]bool {
 func writePicksTable(w io.Writer, st conStyles, working, torn []endpointResult, ping bool) {
 	speed := anySpeed(working) || anySpeed(torn)
 	tg := anyTG(working) || anyTG(torn)
+	mtu := anyMTU(working) || anyMTU(torn)
 	metrics := func(r endpointResult) []string {
-		return append(append(tunCells(r, ping), tgCells(r, tg)...), speedCells(r, speed)...)
+		return append(append(append(tunCells(r, ping), tgCells(r, tg)...), mtuCells(r, mtu)...), speedCells(r, speed)...)
 	}
 
 	var rows []pickRow
@@ -599,7 +701,7 @@ func writePicksTable(w io.Writer, st conStyles, working, torn []endpointResult, 
 			for _, r := range nodePicks(picks) {
 				cells := append([]string{subnet, r.endpoint, r.epPingStr()}, metrics(r)...)
 				cells = append(cells, exitRegion(r.exit), exitColo(r.exit), exitColoLocation(r.exit))
-				rows = append(rows, pickRow{cells, statusOK, r.tgOK, r.tg, r.loss, r.sortPing(), r.speed})
+				rows = append(rows, pickRow{cells, statusOK, r.tgOK, r.mtuOK, r.tg, r.loss, r.sortPing(), r.speed})
 			}
 			continue
 		}
@@ -607,23 +709,30 @@ func writePicksTable(w io.Writer, st conStyles, working, torn []endpointResult, 
 			r := bestByPing(picks)
 			cells := append([]string{subnet, r.endpoint, r.epPingStr()}, metrics(r)...)
 			cells = append(cells, "torn down", "", "")
-			rows = append(rows, pickRow{cells, statusTorn, r.tgOK, r.tg, r.loss, r.sortPing(), r.speed})
+			rows = append(rows, pickRow{cells, statusTorn, r.tgOK, r.mtuOK, r.tg, r.loss, r.sortPing(), r.speed})
 			continue
 		}
 		cells := []string{subnet, "no working endpoints", ""}
-		cells = append(cells, make([]string, len(tunHeaders(ping))+len(tgHeaders(tg))+len(speedHeaders(speed)))...)
+		cells = append(cells, make([]string, len(tunHeaders(ping))+len(tgHeaders(tg))+len(mtuHeaders(mtu))+len(speedHeaders(speed)))...)
 		cells = append(cells, "", "", "")
-		rows = append(rows, pickRow{cells, statusNone, false, 0, 0, 0, 0})
+		rows = append(rows, pickRow{cells, statusNone, false, false, 0, 0, 0, 0})
 	}
 	// Status first: a subnet with no result carries a synthetic 0% loss, which
 	// would otherwise sort it above a working endpoint that measured any loss.
 	// Then Telegram, so the table follows the order its own title promises.
+	// Then MTU ok: among Telegram-working picks, a path where full-size
+	// segments flow outranks one where only small packets survive. Unmeasured
+	// ("-") sorts with failed — the mark tells them apart, the way tgOK lumps
+	// blocked with unchecked.
 	sort.SliceStable(rows, func(i, j int) bool {
 		if rows[i].status != rows[j].status {
 			return rows[i].status < rows[j].status
 		}
 		if rows[i].tgOK != rows[j].tgOK {
 			return rows[i].tgOK
+		}
+		if rows[i].mtuOK != rows[j].mtuOK {
+			return rows[i].mtuOK
 		}
 		if tgSort && rows[i].tgOK && rows[i].tg != rows[j].tg {
 			return rows[i].tg < rows[j].tg
@@ -636,11 +745,12 @@ func writePicksTable(w io.Writer, st conStyles, working, torn []endpointResult, 
 
 	headers := append([]string{"SUBNET", "ENDPOINT", "ENDPOINT PING"}, tunHeaders(ping)...)
 	headers = append(headers, tgHeaders(tg)...)
+	headers = append(headers, mtuHeaders(mtu)...)
 	headers = append(headers, speedHeaders(speed)...)
 	headers = append(headers, "SEEN AS", "NODE", "NODE LOCATION")
-	accentCols := metricCols(2, 1+len(tunHeaders(ping))+len(tgHeaders(tg))+len(speedHeaders(speed)))
+	accentCols := metricCols(2, 1+len(tunHeaders(ping))+len(tgHeaders(tg))+len(mtuHeaders(mtu))+len(speedHeaders(speed)))
 
-	fmt.Fprintln(w, "\n"+st.title.Render("Best endpoint per subnet and node ("+bestNote(ping, tg)+")"))
+	fmt.Fprintln(w, "\n"+st.title.Render("Best endpoint per subnet and node ("+picksTitle(ping, tg, mtu)+")"))
 	t := table.New().
 		Border(lipgloss.RoundedBorder()).
 		BorderStyle(st.dim).
@@ -670,6 +780,15 @@ func writePicksTable(w io.Writer, st conStyles, working, torn []endpointResult, 
 		t.Row(pr.cells...)
 	}
 	fmt.Fprintln(w, t.Render())
+}
+
+// picksTitle is the table's sort promise: the picks table ranks MTU ok above
+// everything the shared bestNote names, so the title says so when the phase ran.
+func picksTitle(ping, tg, mtu bool) string {
+	if mtu {
+		return "MTU ok first, then " + bestNote(ping, tg)
+	}
+	return bestNote(ping, tg)
 }
 
 func uniqueSorted(working []endpointResult, key func(endpointResult) string, flagFor func(string) string) string {
@@ -739,10 +858,11 @@ func speedTargets(results []endpointResult) []endpointResult {
 
 func writeNodePicks(w io.Writer, working []endpointResult, ping, speed, tg bool) {
 	picks := nodePicks(working)
+	mtu := anyMTU(working)
 	fmt.Fprintf(w, "\n# Best endpoint per node (%s)\n", bestNote(ping, tg))
-	fmt.Fprintf(w, nodePickRowFmt, "NODE", "ENDPOINT", "ENDPOINT PING", tunFields("TUN PING", "LOSS", ping), tgField("TG", tg), speedField("SPEED", speed), "SEEN AS", "NODE LOCATION")
+	fmt.Fprintf(w, nodePickRowFmt, "NODE", "ENDPOINT", "ENDPOINT PING", tunFields("TUN PING", "LOSS", ping), tgField("TG", tg), mtuField("MTU", mtu), speedField("SPEED", speed), "SEEN AS", "NODE LOCATION")
 	for _, r := range picks {
-		fmt.Fprintf(w, nodePickRowFmt, exitColo(r.exit), r.endpoint, r.epPingStr(), tunFieldsOf(r, ping), tgField(tgStr(r), tg), speedField(speedStr(r.speed), speed), exitRegion(r.exit), exitColoLocation(r.exit))
+		fmt.Fprintf(w, nodePickRowFmt, exitColo(r.exit), r.endpoint, r.epPingStr(), tunFieldsOf(r, ping), tgField(tgStr(r), tg), mtuField(mtuStr(r), mtu), speedField(speedStr(r.speed), speed), exitRegion(r.exit), exitColoLocation(r.exit))
 	}
 }
 

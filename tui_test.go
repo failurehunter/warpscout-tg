@@ -79,6 +79,44 @@ func TestScanModelTelegramFeed(t *testing.T) {
 	}
 }
 
+func TestScanModelMTU(t *testing.T) {
+	var m tea.Model = newScanModel(nil, false)
+
+	step := func(msg tea.Msg) { m, _ = m.Update(msg) }
+	step(mtuMsg{endpoint: "a:2408", ok: true, dcns: allDCs, seen: true})
+	step(mtuMsg{endpoint: "b:2408", ok: false, dcns: 0b011, seen: true})
+	step(mtuMsg{endpoint: "c:2408", ok: false, seen: true})
+	step(mtuMsg{endpoint: "d:2408"})
+
+	sm := m.(scanModel)
+	var got []string
+	for _, r := range sm.mtus {
+		got = append(got, r.endpoint)
+	}
+	if want := []string{"a:2408", "b:2408", "c:2408", "d:2408"}; !slices.Equal(got, want) {
+		t.Errorf("mtu order = %v, want %v (passing first, then endpoint)", got, want)
+	}
+
+	view := m.View()
+	for _, want := range []string{"MTU", "ok", "2/5", "blocked", "-"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("MTU section is missing %q:\n%s", want, view)
+		}
+	}
+}
+
+func TestPlainMTU(t *testing.T) {
+	var buf bytes.Buffer
+	plainOut = &buf
+	defer func() { plainOut = os.Stderr }()
+
+	plainEmit(mtuMsg{endpoint: "a:2408", ok: true, dcns: allDCs, seen: true})
+	plainEmit(mtuMsg{endpoint: "b:2408"})
+	if got, want := buf.String(), "  a:2408                 ok\n  b:2408                 -\n"; got != want {
+		t.Errorf("plain MTU =\n%q\nwant\n%q", got, want)
+	}
+}
+
 func TestScanModelFitsWindow(t *testing.T) {
 	var m tea.Model = newScanModel(nil, false)
 	m, _ = m.Update(tea.WindowSizeMsg{Width: 60, Height: 20})

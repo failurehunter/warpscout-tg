@@ -1337,6 +1337,88 @@ func TestPicksTableTelegramFirst(t *testing.T) {
 	}
 }
 
+// -conf and -best take the picks table's top row, so bestOverall must agree
+// with its MTU-ok-first order: a slower endpoint that passed 1200B beats a
+// faster partial one, and without measurements the faster still wins.
+func TestBestOverallMTUFirst(t *testing.T) {
+	pick := func(addr string, ms int, mtuOK, mtuSeen bool) endpointResult {
+		mask := uint8(0)
+		if mtuOK {
+			mask = allDCs
+		}
+		return endpointResult{
+			ip:       netip.MustParseAddr(addr),
+			endpoint: addr + ":2408",
+			epPing:   time.Duration(ms) * time.Millisecond,
+			tg:       time.Duration(ms) * time.Millisecond,
+			tgOK:     true,
+			tgSeen:   true,
+			mtuDCs:   mask,
+			mtuOK:    mtuOK,
+			mtuSeen:  mtuSeen,
+			ok:       true,
+			durable:  true,
+		}
+	}
+	fastPartial := pick("8.47.69.10", 5, false, true)
+	slowOK := pick("8.6.112.10", 40, true, true)
+	best, ok := bestOverall(phaseResult{results: []endpointResult{fastPartial, slowOK}})
+	if !ok || best.endpoint != slowOK.endpoint {
+		t.Errorf("bestOverall = %v, want the slower MTU-ok %s", best.endpoint, slowOK.endpoint)
+	}
+
+	// No MTU phase ran: the mark is "-" everywhere and the faster wins back.
+	unseen := pick("8.6.112.10", 40, false, false)
+	best, ok = bestOverall(phaseResult{results: []endpointResult{fastPartial, unseen}})
+	if !ok || best.endpoint != fastPartial.endpoint {
+		t.Errorf("bestOverall without MTU = %v, want the faster %s", best.endpoint, fastPartial.endpoint)
+	}
+}
+
+func TestPicksTableMTUFirst(t *testing.T) {
+	defer func(saved []netip.Prefix) { pools = saved }(pools)
+	pools, _ = parseTargets("8.47.69.0/24,8.6.112.0/24")
+
+	pick := func(addr string, ms int, mtuOK bool) endpointResult {
+		mask := uint8(0)
+		if mtuOK {
+			mask = allDCs
+		}
+		return endpointResult{
+			ip:       netip.MustParseAddr(addr),
+			endpoint: addr + ":2408",
+			epPing:   time.Duration(ms) * time.Millisecond,
+			exit:     metaResult{loc: "RU", colo: "HEL"},
+			tg:       time.Duration(ms) * time.Millisecond,
+			tgOK:     true,
+			tgSeen:   true,
+			mtuDCs:   mask,
+			mtuOK:    mtuOK,
+			mtuSeen:  true,
+			ok:       true,
+			durable:  true,
+		}
+	}
+	working := []endpointResult{
+		pick("8.47.69.10", 5, false), // faster, but full-size segments die
+		pick("8.6.112.10", 40, true),
+	}
+
+	var buf bytes.Buffer
+	r := lipgloss.NewRenderer(&buf)
+	r.SetColorProfile(termenv.Ascii)
+	writePicksTable(&buf, newConStyles(r), working, nil, false)
+
+	out := buf.String()
+	okFirst, partial := strings.Index(out, "8.6.112.10:2408"), strings.Index(out, "8.47.69.10:2408")
+	if okFirst < 0 || partial < 0 {
+		t.Fatalf("picks table lost a row:\n%s", out)
+	}
+	if okFirst > partial {
+		t.Errorf("picks table ranks a partial-MTU endpoint above one that passed 1200B:\n%s", out)
+	}
+}
+
 func TestAccountToRotate(t *testing.T) {
 	dir := t.TempDir()
 
@@ -1862,6 +1944,118 @@ func TestMTProtoProbe(t *testing.T) {
 	}
 }
 
+func TestBuildReqPQ(t *testing.T) {
+	msg, _ := buildReqPQ(20)
+	if len(msg) != 4+4+20+20 {
+		t.Errorf("plain request is %d bytes, want 48", len(msg))
+	}
+	if !bytes.Equal(msg[:4], []byte{0xee, 0xee, 0xee, 0xee}) {
+		t.Errorf("request magic = % x, want intermediate transport", msg[:4])
+	}
+	if n := binary.LittleEndian.Uint32(msg[4:8]); n != 40 {
+		t.Errorf("plain frame length = %d, want 40", n)
+	}
+	// Past the magic: auth(8) + msgid(8) + mdlen(4) + body.
+	if mdlen := binary.LittleEndian.Uint32(msg[24:28]); mdlen != 20 {
+		t.Errorf("plain message length = %d, want 20", mdlen)
+	}
+	big, _ := buildReqPQ(mtuProbeLen)
+	if len(big) != 4+4+20+mtuProbeLen {
+		t.Errorf("padded request is %d bytes, want %d", len(big), 4+4+20+mtuProbeLen)
+	}
+	if mdlen := binary.LittleEndian.Uint32(big[24:28]); mdlen != mtuProbeLen {
+		t.Errorf("padded message length = %d, want %d", mdlen, mtuProbeLen)
+	}
+	if n := binary.LittleEndian.Uint32(big[4:8]); n != 20+mtuProbeLen {
+		t.Errorf("padded frame length = %d, want %d", n, 20+mtuProbeLen)
+	}
+}
+
+// TestMTUProbe runs the padded probe against a fake DC: same res_pq answers
+// as the plain probe, so only the request size differs. The fake DC asserts
+// the padding actually went out.
+func TestMTUProbe(t *testing.T) {
+	run := func(server func(net.Conn)) error {
+		client, dc := net.Pipe()
+		defer client.Close()
+		go server(dc)
+		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+		defer cancel()
+		return mtuProbe(ctx, client)
+	}
+	const resPQ = 0x05162463
+	frame := func(ctor uint32, nonce []byte) []byte {
+		data := binary.LittleEndian.AppendUint32(nil, ctor)
+		data = append(append(data, nonce...), make([]byte, 28)...)
+		out := binary.LittleEndian.AppendUint64(nil, 0)
+		out = binary.LittleEndian.AppendUint64(out, 1<<32) // msg_id
+		out = binary.LittleEndian.AppendUint32(out, uint32(len(data)))
+		out = append(out, data...)
+		return append(binary.LittleEndian.AppendUint32(nil, uint32(len(out))), out...)
+	}
+	answer := func(c net.Conn) {
+		defer c.Close()
+		hdr := make([]byte, 8)
+		if _, err := io.ReadFull(c, hdr); err != nil {
+			t.Errorf("fake DC read header: %v", err)
+			return
+		}
+		if !bytes.Equal(hdr[:4], []byte{0xee, 0xee, 0xee, 0xee}) {
+			t.Errorf("probe magic = % x, want intermediate transport", hdr[:4])
+			return
+		}
+		n := binary.LittleEndian.Uint32(hdr[4:8])
+		if n != 20+mtuProbeLen {
+			t.Errorf("probe frame length = %d, want %d", n, 20+mtuProbeLen)
+			return
+		}
+		req := make([]byte, n)
+		if _, err := io.ReadFull(c, req); err != nil {
+			t.Errorf("fake DC read body: %v", err)
+			return
+		}
+		if mdlen := binary.LittleEndian.Uint32(req[16:20]); mdlen != mtuProbeLen {
+			t.Errorf("probe message length = %d, want %d", mdlen, mtuProbeLen)
+			return
+		}
+		if ctor := binary.LittleEndian.Uint32(req[20:24]); ctor != 0xbe7e8ef1 {
+			t.Errorf("probe constructor = %#x, want req_pq_multi", ctor)
+			return
+		}
+		c.Write(frame(resPQ, req[24:40]))
+	}
+
+	if err := run(answer); err != nil {
+		t.Errorf("padded probe against an answering DC: %v", err)
+	}
+
+	// Wrong nonce, truncated body, silent far end: the same rejections as the
+	// plain probe, since they share the read path.
+	if err := run(func(c net.Conn) {
+		defer c.Close()
+		req := make([]byte, 8+20+mtuProbeLen)
+		io.ReadFull(c, req)
+		c.Write(frame(resPQ, make([]byte, 16)))
+	}); err == nil {
+		t.Error("padded probe accepted an answer to a different nonce")
+	}
+	short := func(c net.Conn) {
+		defer c.Close()
+		req := make([]byte, 8+20+mtuProbeLen)
+		if _, err := io.ReadFull(c, req); err != nil {
+			return
+		}
+		full := frame(resPQ, req[24:40])
+		c.Write(full[:len(full)/2])
+	}
+	if err := run(short); err == nil {
+		t.Error("padded probe accepted a truncated answer")
+	}
+	if err := run(func(c net.Conn) { io.Copy(io.Discard, c) }); err == nil {
+		t.Error("padded probe reported a silent connection as answered")
+	}
+}
+
 func TestTelegramColumn(t *testing.T) {
 	reached := endpointResult{endpoint: "1.2.3.4:2408", tg: 40 * time.Millisecond, tgDCs: allDCs, tgOK: true, tgSeen: true, ok: true, durable: true}
 	blocked := endpointResult{endpoint: "5.6.7.8:2408", tgSeen: true, ok: true, durable: true}
@@ -1912,6 +2106,71 @@ func TestTelegramColumn(t *testing.T) {
 		if strings.Contains(noTG.String(), unwanted) {
 			t.Errorf("report without -tg leaks %q:\n%s", unwanted, noTG.String())
 		}
+	}
+}
+
+func TestMTUColumn(t *testing.T) {
+	okRow := endpointResult{endpoint: "1.2.3.4:2408", ok: true, durable: true, mtuSeen: true, mtuOK: true, mtuDCs: allDCs}
+	partRow := endpointResult{endpoint: "7.7.7.7:2408", ok: true, durable: true, mtuSeen: true, mtuDCs: 0b00101}
+	blockedRow := endpointResult{endpoint: "5.6.7.8:2408", ok: true, durable: true, mtuSeen: true}
+	unseenRow := endpointResult{endpoint: "9.9.9.9:2408", ok: true, durable: true}
+	for _, c := range []struct {
+		r    endpointResult
+		want string
+	}{{okRow, "ok"}, {partRow, "2/5"}, {blockedRow, "blocked"}, {unseenRow, "-"}} {
+		if got := mtuStr(c.r); got != c.want {
+			t.Errorf("mtuStr(%s) = %q, want %q", c.r.endpoint, got, c.want)
+		}
+	}
+	if anyMTU([]endpointResult{unseenRow}) {
+		t.Error("anyMTU reported an unmeasured set as measured")
+	}
+	if !anyMTU([]endpointResult{unseenRow, blockedRow}) {
+		t.Error("anyMTU missed a set the phase ran on")
+	}
+
+	var withMTU bytes.Buffer
+	writeFullReport(&withMTU, []endpointResult{okRow, partRow, blockedRow}, false)
+	for _, want := range []string{"MTU", "ok", "2/5", "blocked", "# MTU = one 1200B"} {
+		if !strings.Contains(withMTU.String(), want) {
+			t.Errorf("MTU report is missing %q:\n%s", want, withMTU.String())
+		}
+	}
+
+	var noMTU bytes.Buffer
+	writeFullReport(&noMTU, []endpointResult{unseenRow}, false)
+	for _, unwanted := range []string{"MTU", "1200B"} {
+		if strings.Contains(noMTU.String(), unwanted) {
+			t.Errorf("report without the MTU phase leaks %q:\n%s", unwanted, noMTU.String())
+		}
+	}
+
+	var note bytes.Buffer
+	rPlain := lipgloss.NewRenderer(&note)
+	rPlain.SetColorProfile(termenv.Ascii)
+	writeMTUNote(&note, newConStyles(rPlain), []endpointResult{okRow, partRow, blockedRow})
+	if want := "1 / 3 picks pass 1200B to all 5 DCs"; !strings.Contains(note.String(), want) {
+		t.Errorf("MTU summary is missing %q:\n%s", want, note.String())
+	}
+
+	// Only partial picks: the summary must name the DCs whose padded answers
+	// nobody saw, and a partial pick must not count as passing.
+	var partialOnly bytes.Buffer
+	rPart := lipgloss.NewRenderer(&partialOnly)
+	rPart.SetColorProfile(termenv.Ascii)
+	writeMTUNote(&partialOnly, newConStyles(rPart), []endpointResult{partRow, blockedRow})
+	for _, want := range []string{"0 / 2 picks pass 1200B to all 5 DCs", "DC2, DC4, DC5 never answered padded"} {
+		if !strings.Contains(partialOnly.String(), want) {
+			t.Errorf("partial-only MTU summary is missing %q:\n%s", want, partialOnly.String())
+		}
+	}
+
+	var empty bytes.Buffer
+	rEmpty := lipgloss.NewRenderer(&empty)
+	rEmpty.SetColorProfile(termenv.Ascii)
+	writeMTUNote(&empty, newConStyles(rEmpty), []endpointResult{unseenRow})
+	if empty.Len() != 0 {
+		t.Errorf("MTU summary printed without measurements:\n%s", empty.String())
 	}
 }
 

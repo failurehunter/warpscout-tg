@@ -98,31 +98,31 @@ func dcNames(mask uint8) string {
 	return strings.Join(names, ", ")
 }
 
-// mtprotoProbe speaks just enough MTProto to make a DC answer: the
-// intermediate-transport magic plus an unencrypted req_pq_multi. A bare TCP
-// connect proves nothing — DPI boxes complete the handshake toward Telegram
-// and silently drop the payload, so connect-only checks pass everywhere.
-// Only response bytes framed by the transport mean the DC really talked back.
-func mtprotoProbe(ctx context.Context, conn net.Conn) error {
-	if d, ok := ctx.Deadline(); ok {
-		conn.SetDeadline(d)
-		defer conn.SetDeadline(time.Time{})
-	}
-
-	msg := make([]byte, 0, 4+4+40)
+// buildReqPQ frames an unencrypted req_pq_multi with mdlen bytes of message
+// (constructor + nonce + random padding). mtprotoProbe uses mdlen 20,
+// mtuProbe mtuProbeLen. Shared framing keeps both probes' bytes identical
+// where they overlap: the fake DC in TestMTProtoProbe asserts the 48-byte
+// plain request exactly.
+func buildReqPQ(mdlen int) (msg []byte, nonce [16]byte) {
+	msg = make([]byte, 0, 4+4+20+mdlen)
 	msg = append(msg, 0xee, 0xee, 0xee, 0xee)                                  // intermediate transport
-	msg = binary.LittleEndian.AppendUint32(msg, 40)                            // frame: auth_key_id + msg_id + len + req_pq_multi
+	msg = binary.LittleEndian.AppendUint32(msg, uint32(20+mdlen))              // frame: auth_key_id + msg_id + len + message
 	msg = append(msg, make([]byte, 8)...)                                      // auth_key_id = 0, plaintext message
 	msg = binary.LittleEndian.AppendUint64(msg, uint64(time.Now().Unix())<<32) // msg_id: unixtime<<32, %4 == 0 as clients must
-	msg = binary.LittleEndian.AppendUint32(msg, 20)                            // message_data_length
+	msg = binary.LittleEndian.AppendUint32(msg, uint32(mdlen))                 // message_data_length
 	msg = binary.LittleEndian.AppendUint32(msg, 0xbe7e8ef1)                    // req_pq_multi
-	var nonce [16]byte
 	rand.Read(nonce[:])
 	msg = append(msg, nonce[:]...)
-
-	if _, err := conn.Write(msg); err != nil {
-		return err
+	if pad := mdlen - 20; pad > 0 {
+		msg = append(msg, make([]byte, pad)...)
+		rand.Read(msg[len(msg)-pad:])
 	}
+	return msg, nonce
+}
+
+// readResPQ reads one frame and checks it through the nonce echo. Both probes
+// share it: the request size differs, the answer shape does not.
+func readResPQ(conn net.Conn, nonce []byte) error {
 	var hdr [4]byte
 	if _, err := io.ReadFull(conn, hdr[:]); err != nil {
 		return err
@@ -149,10 +149,28 @@ func mtprotoProbe(ctx context.Context, conn net.Conn) error {
 	}
 	// 128 random bits coming back is what proves something parsed our
 	// req_pq_multi, rather than answered with bytes of its own.
-	if !bytes.Equal(body[24:40], nonce[:]) {
+	if !bytes.Equal(body[24:40], nonce) {
 		return fmt.Errorf("mtproto: answer does not echo our nonce")
 	}
 	return nil
+}
+
+// mtprotoProbe speaks just enough MTProto to make a DC answer: the
+// intermediate-transport magic plus an unencrypted req_pq_multi. A bare TCP
+// connect proves nothing — DPI boxes complete the handshake toward Telegram
+// and silently drop the payload, so connect-only checks pass everywhere.
+// Only response bytes framed by the transport mean the DC really talked back.
+func mtprotoProbe(ctx context.Context, conn net.Conn) error {
+	if d, ok := ctx.Deadline(); ok {
+		conn.SetDeadline(d)
+		defer conn.SetDeadline(time.Time{})
+	}
+
+	msg, nonce := buildReqPQ(20)
+	if _, err := conn.Write(msg); err != nil {
+		return err
+	}
+	return readResPQ(conn, nonce[:])
 }
 
 // Smallest res_pq worth reading: auth_key_id, msg_id, message_data_length,
@@ -177,4 +195,46 @@ func (s *ipStack) telegramRTT(ctx context.Context, timeout time.Duration) (rtt t
 		}
 		return conn, nil
 	}, telegramDCs, timeout)
+}
+
+// mtuProbeLen is the message_data_length of the MTU probe: a req_pq body of
+// 20 bytes plus random padding, sized so the frame (~1230 bytes on the wire
+// with headers) exercises full-size in-tunnel segments without exceeding the
+// 1280 interface MTU.
+const mtuProbeLen = 1200
+
+// mtuProbe asks the DC the same req_pq question with a full-size body and
+// checks the res_pq answer the same way short probes do: an answer that
+// arrived whole proves full-size segments survive the exit, where the 48-byte
+// TG dial proves only small ones do. Upload direction only — the answer stays
+// ~100 bytes, and bulk download has no unauthenticated probe.
+func mtuProbe(ctx context.Context, conn net.Conn) error {
+	if d, ok := ctx.Deadline(); ok {
+		conn.SetDeadline(d)
+		defer conn.SetDeadline(time.Time{})
+	}
+
+	msg, nonce := buildReqPQ(mtuProbeLen)
+	if _, err := conn.Write(msg); err != nil {
+		return err
+	}
+	return readResPQ(conn, nonce[:])
+}
+
+// telegramMTURTT runs one padded req_pq per DC and folds the answers the way
+// telegramRTT does. Only the mask matters downstream: a DC whose padded
+// answer arrived whole passes full-size segments.
+func (s *ipStack) telegramMTURTT(ctx context.Context, timeout time.Duration) uint8 {
+	_, reached := reachedDCs(ctx, func(ctx context.Context, addr string) (net.Conn, error) {
+		conn, err := s.tnet.DialContext(ctx, "tcp", addr)
+		if err != nil {
+			return nil, err
+		}
+		if err := mtuProbe(ctx, conn); err != nil {
+			conn.Close()
+			return nil, err
+		}
+		return conn, nil
+	}, telegramDCs, timeout)
+	return reached
 }

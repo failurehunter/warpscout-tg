@@ -95,7 +95,7 @@ var (
 		{"", "ping-target", "ADDR", fmt.Sprintf("IP address or hostname the TUN PING/LOSS columns measure to, resolved inside the tunnel (default %s); needs -tun-ping", pingTarget)},
 		{"", "tun-ping-count", "N", fmt.Sprintf("echoes per durability burst, %dms apart - a longer burst catches tunnels DPI kills late (default %d, implies -tun-ping)", pingInterval.Milliseconds(), durabilityPings)},
 		{"", "speed", "", "add the SPEED column: after the scan, download-test every endpoint the tables pick, one at a time (slow, and it does not change the ranking)"},
-		{"", "tg", "", "add the TG column: dial Telegram's MTProto data centres through each tunnel and report the round-trip to the nearest one, or \"blocked\" when none answer; endpoints that reach Telegram then rank above those that do not"},
+		{"", "tg", "", "add the TG column: dial Telegram's MTProto data centres through each tunnel and report the round-trip to the nearest one, or \"blocked\" when none answer; picked endpoints additionally get one 1200B padded probe per DC (MTU column, ok first in the picks table and in -best/-conf); endpoints that reach Telegram then rank above those that do not"},
 		{"n", "sample", "N", "addresses to sample per subnet"},
 		{"f", "full", "", "scan all 256 addresses per subnet (overrides -sample)"},
 		{"", "port", "N", "probe only this port on every endpoint instead of picking the first reachable one (skips phase 1)"},
